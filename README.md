@@ -31,8 +31,9 @@ están disponibles solo en Windows.
   texto del móvil.
 - **Información del dispositivo:** muestra datos del sistema, procesador,
   batería, memoria, almacenamiento y pantalla; permite copiar el informe.
-- **Transferencia e instalación:** envía archivos a `/sdcard/Download`, lista y
-  descarga archivos de una ruta del móvil e instala APK desde el PC.
+- **Gestor de archivos:** ventana de dos paneles PC/móvil, navegación por
+  carpetas, selección múltiple, cola de subidas y descargas e instalación de APK.
+  Previsualización integrada de fotos y fragmentos de vídeo con dependencias opcionales.
 - **Notificaciones y registro:** puede supervisar determinados mensajes de
   `logcat`; muestra avisos emergentes en Windows y registra actividad dentro de
   la aplicación en ambos sistemas.
@@ -43,6 +44,56 @@ están disponibles solo en Windows.
   permite volver a habilitarlos desde un punto de restauración.
 - **Análisis de estado:** junto al debloat y con la misma detección existente,
   consulta el estado del móvil sin modificar ajustes ni proponer optimizaciones.
+
+## Gestor de archivos
+
+En **Transferencia Archivos & APKs**, pulsa **Abrir gestor de archivos** con el
+móvil conectado. El panel izquierdo corresponde al PC y el derecho al móvil.
+Introduce una ruta y pulsa Intro, usa la carpeta superior o haz doble clic en
+una carpeta. El selector del PC permite cambiar también de unidad; el móvil
+incluye accesos a Descargas, Cámara, Imágenes y Vídeos.
+
+Selecciona uno o varios elementos y pulsa **Subir** o **Descargar**. El destino
+es la carpeta abierta en el panel contrario. Las carpetas se copian completas.
+Se pide confirmación y se rechazan destinos ya existentes, sin sobrescribir ni
+combinar contenido. La cola muestra los archivos pendientes, en curso,
+completados o con error; selecciona una fila para consultar su detalle.
+**Cancelar pendientes** no interrumpe la transferencia activa. Un error puede
+dejar un archivo o carpeta parcial en el destino; no se borra automáticamente.
+El gestor conserva el dispositivo elegido al abrirse aunque cambie la conexión
+activa en la ventana principal. No permite borrar archivos del móvil.
+
+### Fotos y vídeos
+
+Selecciona una imagen para verla en el panel **Vista previa**, sin abrir una
+aplicación externa. Los vídeos muestran en bucle un fragmento de hasta seis
+segundos, a cinco fotogramas por segundo y sin sonido, con pausa/reproducción.
+No es un reproductor completo. Puedes desactivar la vista previa automática o
+solicitarla con doble clic o con el menú contextual.
+
+Las fotos y vídeos del móvil se descargan primero a una carpeta temporal del PC,
+que se elimina al terminar de generar la vista previa; no se modifica el original.
+Los archivos remotos mayores de 32 MB no se descargan automáticamente y requieren
+confirmación manual. La compatibilidad depende de los formatos que admitan los
+decodificadores; no se garantiza HEIC, contenido protegido ni todos los códecs.
+
+El gestor y las transferencias funcionan con la biblioteca estándar. Para las
+previsualizaciones, instala las dependencias opcionales en el **mismo Python
+con el que ejecutes la aplicación**:
+
+```powershell
+py -m pip install Pillow imageio-ffmpeg
+```
+
+En Linux, usa `python3 -m pip install Pillow imageio-ffmpeg` dentro de un entorno
+virtual. Pillow decodifica las imágenes e `imageio-ffmpeg` proporciona FFmpeg para
+el vídeo; si ya hay `ffmpeg` en `PATH`, se utiliza ese ejecutable.
+En el entorno virtual de este proyecto ya están instaladas. En Windows puedes
+ejecutar la aplicación con ese entorno:
+
+```powershell
+.\.venv\Scripts\pythonw.exe .\androidcontrol.pyw
+```
 
 ## Análisis de estado
 

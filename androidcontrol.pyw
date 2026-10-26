@@ -8,6 +8,11 @@ import json
 import shutil
 import queue
 import re
+import posixpath
+import shlex
+import tempfile
+import stat
+from concurrent.futures import ThreadPoolExecutor
 
 # --- FLAGS DE CREACIÓN PARA EVITAR CONSOLAS DE CMD EN WINDOWS ---
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -63,6 +68,596 @@ DIAGNOSTIC_SETTINGS = (
     "window_animation_scale", "transition_animation_scale", "animator_duration_scale",
     "stay_on_while_plugged_in", "always_finish_activities"
 )
+
+
+def center_popup(window, width, height):
+    window.update_idletasks()
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    width = min(width, max(1, screen_width - 40))
+    height = min(height, max(1, screen_height - 80))
+    minimum_width, minimum_height = window.minsize()
+    window.minsize(min(minimum_width, width), min(minimum_height, height))
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    geometry = f"{width}x{height}+{x}+{y}"
+    window.geometry(geometry)
+    window.after_idle(lambda: window.geometry(geometry) if window.winfo_exists() else None)
+
+
+class AndroidFileBrowser:
+    def __init__(self, device, runner=subprocess.run):
+        if not device:
+            raise ValueError("Conecta un dispositivo Android.")
+        self.device = device
+        self.runner = runner
+
+    def run(self, *args, timeout=30):
+        result = self.runner(["adb", "-s", self.device, *args], capture_output=True,
+                             timeout=timeout, **PROCESS_CREATION_OPTIONS)
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode("utf-8", "replace").strip()
+                               or result.stdout.decode("utf-8", "replace").strip() or "Error ADB")
+        return result.stdout
+
+    def list_directory(self, path):
+        if not path.startswith("/") or "\x00" in path:
+            raise ValueError("La ruta Android debe ser absoluta.")
+        quoted = shlex.quote(posixpath.normpath(path))
+        script = (
+            f"[ -d {quoted} ] && [ -r {quoted} ] && [ -x {quoted} ] || exit 1; "
+            f"for item in {quoted}/* {quoted}/.[!.]* {quoted}/..?*; do "
+            '[ -e "$item" ] || [ -L "$item" ] || continue; '
+            'kind=f; [ ! -d "$item" ] || kind=d; '
+            'metadata=$(stat -c "%s %Y" -- "$item") || exit 1; '
+            'printf "%s\\0%s\\0%s\\0" "$kind" "$metadata" "$item"; done'
+        )
+        output = self.run("exec-out", "sh", "-c", script)
+        fields = output.split(b"\x00")
+        if fields[-1] != b"" or (len(fields) - 1) % 3:
+            raise RuntimeError("Android devolvio un listado incompleto.")
+        entries = []
+        for offset in range(0, len(fields) - 1, 3):
+            kind, metadata, raw_path = fields[offset:offset + 3]
+            size, modified = metadata.decode("ascii").split()
+            full_path = raw_path.decode("utf-8", "strict")
+            entries.append({"name": posixpath.basename(full_path), "path": full_path,
+                            "directory": kind == b"d", "size": int(size), "modified": int(modified)})
+        return sorted(entries, key=lambda entry: (not entry["directory"], entry["name"].casefold()))
+
+    def transfer(self, direction, source, destination):
+        if direction not in ("push", "pull"):
+            raise ValueError("Transferencia no permitida.")
+        self.run(direction, source, destination, timeout=3600)
+
+
+class FileTransferWindow:
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".3gp"}
+
+    def __init__(self, app):
+        self.app = app
+        self.backend = AndroidFileBrowser(app.current_connected_device)
+        self.window = tk.Toplevel(app.root)
+        self.window.title(f"Archivos - {self.backend.device}")
+        self.window.geometry("1180x790")
+        self.window.minsize(900, 650)
+        center_popup(self.window, 1180, 790)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.closed = False
+        self.events = queue.Queue()
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.preview_executor = ThreadPoolExecutor(max_workers=1)
+        self.preview_future = None
+        self.preview_token = 0
+        self.preview_timer = None
+        self.animation_timer = None
+        self.preview_resize_timer = None
+        self.preview_images = []
+        self.frames = []
+        self.frame_index = 0
+        self.playing = True
+        self.pending = []
+        self.active = None
+        self.counter = 0
+        self.generations = {"local": 0, "remote": 0}
+        self.entries = {"local": {}, "remote": {}}
+        self.paths = {"local": os.path.abspath(app.config.get("last_pc_pull_dir") or os.path.expanduser("~")),
+                      "remote": "/sdcard/Download"}
+        if not os.path.isdir(self.paths["local"]):
+            self.paths["local"] = os.path.expanduser("~")
+        self.variables = {}
+        self.trees = {}
+        toolbar = ttk.Frame(self.window, padding=6)
+        toolbar.pack(fill=tk.X)
+        ttk.Button(toolbar, text="Subir →", command=lambda: self.enqueue("push")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="← Descargar", command=lambda: self.enqueue("pull")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Instalar APK", command=self.install_apk).pack(side=tk.LEFT, padx=3)
+        ttk.Label(toolbar, text=f"ADB: {self.backend.device}").pack(side=tk.RIGHT, padx=6)
+        layout = ttk.Panedwindow(self.window, orient=tk.VERTICAL)
+        layout.pack(fill=tk.BOTH, expand=True, padx=6)
+        browsers = ttk.Panedwindow(layout, orient=tk.HORIZONTAL)
+        layout.add(browsers, weight=3)
+        for side, title in (("local", "PC"), ("remote", "Móvil")):
+            panel = ttk.Frame(browsers, padding=4)
+            browsers.add(panel, weight=1)
+            ttk.Label(panel, text=title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            pathbar = ttk.Frame(panel)
+            pathbar.pack(fill=tk.X, pady=4)
+            self.tool_button(pathbar, "↑", "Carpeta superior", lambda selected=side: self.parent(selected))
+            self.tool_button(pathbar, "↻", "Actualizar", lambda selected=side: self.navigate(selected))
+            variable = tk.StringVar(value=self.paths[side])
+            self.variables[side] = variable
+            path_input = ttk.Entry(pathbar, textvariable=variable)
+            path_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+            path_input.bind("<Return>", lambda event, selected=side: self.navigate(selected, self.variables[selected].get()))
+            if side == "local":
+                self.tool_button(pathbar, "…", "Elegir carpeta del PC", self.choose_local)
+            else:
+                shortcut = ttk.Combobox(panel, state="readonly", values=("/sdcard", "/sdcard/Download",
+                                          "/sdcard/DCIM/Camera", "/sdcard/Pictures", "/sdcard/Movies"))
+                shortcut.set("/sdcard/Download")
+                shortcut.pack(fill=tk.X, pady=(0, 4))
+                shortcut.bind("<<ComboboxSelected>>", lambda event, control=shortcut: self.navigate("remote", control.get()))
+            tree_frame = ttk.Frame(panel)
+            tree_frame.pack(fill=tk.BOTH, expand=True)
+            tree = ttk.Treeview(tree_frame, columns=("size", "type", "modified"), selectmode="extended")
+            tree.heading("#0", text="Nombre", command=lambda selected=side: self.sort(selected, "name"))
+            tree.column("#0", width=210, minwidth=100)
+            for column, label, width in (("size", "Tamaño", 85), ("type", "Tipo", 70), ("modified", "Modificado", 135)):
+                tree.heading(column, text=label, command=lambda selected=side, field=column: self.sort(selected, field))
+                tree.column(column, width=width, minwidth=55, stretch=False)
+            scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+            horizontal = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=tree.xview)
+            tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+            tree_frame.rowconfigure(0, weight=1)
+            tree_frame.columnconfigure(0, weight=1)
+            tree.grid(row=0, column=0, sticky="nsew")
+            scroll.grid(row=0, column=1, sticky="ns")
+            horizontal.grid(row=1, column=0, sticky="ew")
+            self.trees[side] = tree
+            tree.bind("<Double-1>", lambda event, selected=side: self.activate(selected))
+            tree.bind("<Return>", lambda event, selected=side: self.activate(selected))
+            tree.bind("<BackSpace>", lambda event, selected=side: self.parent(selected))
+            tree.bind("<<TreeviewSelect>>", lambda event, selected=side: self.schedule_preview(selected))
+            menu = tk.Menu(tree, tearoff=False)
+            menu.add_command(label="Subir selección" if side == "local" else "Descargar selección",
+                             command=lambda selected=side: self.enqueue("push" if selected == "local" else "pull"))
+            menu.add_command(label="Previsualizar", command=lambda selected=side: self.preview(selected, explicit=True))
+            tree.bind("<Button-3>", lambda event, selected=side, context=menu: self.context_menu(event, selected, context))
+        bottom = ttk.Panedwindow(layout, orient=tk.HORIZONTAL)
+        layout.add(bottom, weight=2)
+        transfers = ttk.Frame(bottom, padding=4)
+        bottom.add(transfers, weight=3)
+        queuebar = ttk.Frame(transfers)
+        queuebar.pack(fill=tk.X)
+        ttk.Label(queuebar, text="Transferencias", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(queuebar, text="Cancelar pendientes", command=self.cancel_pending).pack(side=tk.RIGHT)
+        queue_frame = ttk.Frame(transfers)
+        queue_frame.pack(fill=tk.BOTH, expand=True, pady=4)
+        self.queue_tree = ttk.Treeview(queue_frame, columns=("direction", "status"), height=5)
+        self.queue_tree.heading("#0", text="Archivo")
+        self.queue_tree.heading("direction", text="Dirección")
+        self.queue_tree.heading("status", text="Estado")
+        self.queue_tree.column("#0", width=230)
+        self.queue_tree.column("direction", width=90, stretch=False)
+        self.queue_tree.column("status", width=120)
+        self.queue_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        queue_scroll = ttk.Scrollbar(queue_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
+        queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.queue_tree.configure(yscrollcommand=queue_scroll.set)
+        self.queue_tree.bind("<<TreeviewSelect>>", self.show_transfer_detail)
+        self.transfer_details = {}
+        preview_panel = ttk.Frame(bottom, padding=4)
+        bottom.add(preview_panel, weight=2)
+        previewbar = ttk.Frame(preview_panel)
+        previewbar.pack(fill=tk.X)
+        ttk.Label(previewbar, text="Vista previa", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.auto_preview = tk.BooleanVar(value=True)
+        ttk.Checkbutton(previewbar, text="Automática", variable=self.auto_preview).pack(side=tk.RIGHT)
+        self.play_button = ttk.Button(preview_panel, text="Pausar", command=self.toggle_play, state=tk.DISABLED)
+        self.play_button.pack(side=tk.BOTTOM, anchor="e")
+        self.preview_caption = ttk.Label(preview_panel, text="", wraplength=340)
+        self.preview_caption.pack(side=tk.BOTTOM, fill=tk.X)
+        preview_surface = ttk.Frame(preview_panel, width=1, height=1)
+        preview_surface.pack(fill=tk.BOTH, expand=True, pady=4)
+        preview_surface.pack_propagate(False)
+        self.preview_label = ttk.Label(preview_surface, text="Sin selección", anchor="center", background="#202020", foreground="#eeeeee", wraplength=230)
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+        self.preview_label.bind("<Configure>", self.resize_preview)
+        self.status = ttk.Label(self.window, text="", padding=6, wraplength=1050)
+        self.status.pack(fill=tk.X)
+        self.navigate("local")
+        self.navigate("remote")
+        self.window.after(80, self.poll)
+
+    def tool_button(self, parent, icon, label, command):
+        button = ttk.Button(parent, text=icon, width=3, command=command)
+        button.pack(side=tk.LEFT, padx=1)
+        tooltip = []
+
+        def hide(event=None):
+            if tooltip:
+                tooltip.pop().destroy()
+
+        def show(event):
+            hide()
+            tip = tk.Toplevel(self.window)
+            tip.overrideredirect(True)
+            tip.geometry(f"+{event.x_root + 10}+{event.y_root + 15}")
+            ttk.Label(tip, text=label, padding=4).pack()
+            tooltip.append(tip)
+
+        button.bind("<Enter>", show)
+        button.bind("<Leave>", hide)
+        button.bind("<Button-1>", hide)
+
+    @staticmethod
+    def size_text(size):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+            size /= 1024
+
+    def submit(self, work, callback, executor=None):
+        def task():
+            try:
+                result, error = work(), None
+            except Exception as exception:
+                result, error = None, str(exception)
+            self.events.put((callback, result, error))
+        return (executor or self.executor).submit(task)
+
+    def navigate(self, side, path=None):
+        path = path if path is not None else self.paths[side]
+        path = os.path.abspath(os.path.expanduser(path)) if side == "local" else posixpath.normpath(path)
+        self.generations[side] += 1
+        generation = self.generations[side]
+        self.status.configure(text=f"Leyendo {path}...")
+
+        def read():
+            if side == "remote":
+                return self.backend.list_directory(path)
+            entries = []
+            with os.scandir(path) as listing:
+                for item in listing:
+                    try:
+                        info = item.stat()
+                        entries.append(dict(name=item.name, path=item.path, directory=stat.S_ISDIR(info.st_mode),
+                                            size=info.st_size, modified=info.st_mtime))
+                    except OSError:
+                        continue
+            return sorted(entries, key=lambda entry: (not entry["directory"], entry["name"].casefold()))
+
+        def completed(result, error):
+            if generation != self.generations[side]:
+                return
+            if error:
+                self.variables[side].set(self.paths[side])
+                self.status.configure(text=f"No se pudo leer {path}: {error}")
+                return
+            self.paths[side] = path
+            self.variables[side].set(path)
+            tree = self.trees[side]
+            tree.delete(*tree.get_children())
+            self.entries[side] = {}
+            for index, entry in enumerate(result):
+                row = str(index)
+                self.entries[side][row] = entry
+                tree.insert("", tk.END, iid=row, text=entry["name"], values=(
+                    "" if entry["directory"] else self.size_text(entry["size"]),
+                    "Carpeta" if entry["directory"] else os.path.splitext(entry["name"])[1].lower() or "Archivo",
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["modified"]))))
+            self.status.configure(text=f"{path}: {len(result)} elementos")
+            if side == "local":
+                self.app.config["last_pc_pull_dir"] = path
+                save_config(self.app.config)
+
+        self.submit(read, completed)
+
+    def sort(self, side, field):
+        tree = self.trees[side]
+        reverse = getattr(self, "last_sort", None) == (side, field, False)
+        self.last_sort = (side, field, reverse)
+        def key(row):
+            entry = self.entries[side][row]
+            value = (entry["directory"], os.path.splitext(entry["name"])[1]) if field == "type" else entry[field]
+            return value.casefold() if isinstance(value, str) else value
+        rows = sorted(tree.get_children(), key=key, reverse=reverse)
+        rows.sort(key=lambda row: not self.entries[side][row]["directory"])
+        for index, row in enumerate(rows):
+            tree.move(row, "", index)
+
+    def parent(self, side):
+        path = self.paths[side]
+        self.navigate(side, os.path.dirname(path) if side == "local" else posixpath.dirname(path))
+
+    def choose_local(self):
+        path = filedialog.askdirectory(parent=self.window, initialdir=self.paths["local"])
+        if path:
+            self.navigate("local", path)
+
+    def activate(self, side):
+        selected = self.trees[side].selection()
+        if len(selected) == 1:
+            entry = self.entries[side].get(selected[0])
+            if entry and entry["directory"]:
+                self.navigate(side, entry["path"])
+            else:
+                self.preview(side, explicit=True)
+
+    def context_menu(self, event, side, menu):
+        row = self.trees[side].identify_row(event.y)
+        if row:
+            if row not in self.trees[side].selection():
+                self.trees[side].selection_set(row)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+    def enqueue(self, direction):
+        side = "local" if direction == "push" else "remote"
+        target_side = "remote" if direction == "push" else "local"
+        selection = [self.entries[side][row] for row in self.trees[side].selection()]
+        if not selection:
+            messagebox.showwarning("Sin selección", "Selecciona archivos o carpetas.", parent=self.window)
+            return
+        existing = {entry["name"].casefold() if target_side == "local" else entry["name"]
+                    for entry in self.entries[target_side].values()}
+        conflicts = [entry["name"] for entry in selection if (entry["name"].casefold() if target_side == "local"
+                     else entry["name"]) in existing]
+        if conflicts:
+            messagebox.showwarning("Destino ocupado", "No se sobrescribe ni combina contenido existente."
+                                   "\nElige otra carpeta de destino para:\n" + "\n".join(conflicts[:12]), parent=self.window)
+            return
+        if direction == "pull" and any(not self.valid_local_name(entry["name"]) for entry in selection):
+            messagebox.showerror("Nombre incompatible", "La selección contiene nombres no válidos para el PC.", parent=self.window)
+            return
+        if not messagebox.askyesno("Confirmar transferencia", f"¿Transferir {len(selection)} elementos a"
+                                  f"\n{self.paths[target_side]}?\nLas carpetas se copian completas.", parent=self.window):
+            return
+        for entry in selection:
+            join = posixpath.join if direction == "push" else os.path.join
+            destination = join(self.paths[target_side], entry["name"])
+            if any(job["destination"] == destination and job["direction"] == direction
+                   for job in self.pending + ([self.active] if self.active else [])):
+                continue
+            self.counter += 1
+            row = str(self.counter)
+            self.queue_tree.insert("", tk.END, iid=row, text=entry["name"],
+                                   values=("PC → Móvil" if direction == "push" else "Móvil → PC", "Pendiente"))
+            self.pending.append(dict(row=row, direction=direction, source=entry["path"], destination=destination))
+        self.start_next()
+
+    @staticmethod
+    def valid_local_name(name):
+        if name in ("", ".", "..") or "/" in name or "\x00" in name:
+            return False
+        if IS_WINDOWS:
+            return not (re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or name.endswith((" ", "."))
+                        or name.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)),
+                                                         *(f"LPT{number}" for number in range(1, 10))})
+        return True
+
+    def start_next(self):
+        if self.active or not self.pending:
+            return
+        job = self.pending.pop(0)
+        self.active = job
+        self.queue_tree.set(job["row"], "status", "Transfiriendo...")
+
+        def work():
+            if job["direction"] == "pull":
+                if os.path.lexists(job["destination"]):
+                    raise RuntimeError("El destino ya existe; no se sobrescribe.")
+            else:
+                script = f"[ ! -e {shlex.quote(job['destination'])} ] && [ ! -L {shlex.quote(job['destination'])} ]"
+                self.backend.run("shell", "sh", "-c", shlex.quote(script))
+            self.backend.transfer(job["direction"], job["source"], job["destination"])
+
+        def completed(result, error):
+            self.queue_tree.set(job["row"], "status", "Error" if error else "Completado")
+            detail = f"{job['source']} → {job['destination']}" + (f"\n{error}" if error else "")
+            self.transfer_details[job["row"]] = detail
+            self.status.configure(text=detail)
+            self.app.log(detail)
+            self.active = None
+            if not error:
+                self.navigate("remote" if job["direction"] == "push" else "local")
+            self.start_next()
+
+        self.submit(work, completed)
+
+    def cancel_pending(self):
+        for job in self.pending:
+            self.queue_tree.set(job["row"], "status", "Cancelado")
+        self.pending.clear()
+
+    def show_transfer_detail(self, event=None):
+        selected = self.queue_tree.selection()
+        if selected:
+            self.status.configure(text=self.transfer_details.get(selected[0], "Pendiente / en curso"))
+
+    def install_apk(self):
+        selected = self.trees["local"].selection()
+        if len(selected) != 1:
+            messagebox.showwarning("APK", "Selecciona un APK del panel PC.", parent=self.window)
+            return
+        entry = self.entries["local"][selected[0]]
+        if entry["directory"] or not entry["name"].lower().endswith(".apk"):
+            messagebox.showwarning("APK", "La selección no es un APK.", parent=self.window)
+            return
+        if messagebox.askyesno("Instalar APK", f"¿Instalar {entry['name']} en {self.backend.device}?", parent=self.window):
+            def completed(result, error):
+                text = error or result.decode("utf-8", "replace")
+                self.status.configure(text=text)
+                self.app.log(text)
+            self.submit(lambda: self.backend.run("install", "-r", entry["path"], timeout=180), completed)
+
+    def schedule_preview(self, side):
+        if self.preview_timer:
+            self.window.after_cancel(self.preview_timer)
+        self.preview_token += 1
+        self.clear_preview()
+        if self.auto_preview.get():
+            self.preview_timer = self.window.after(350, lambda: self.preview(side))
+
+    def clear_preview(self):
+        if self.animation_timer:
+            self.window.after_cancel(self.animation_timer)
+            self.animation_timer = None
+        self.frames = []
+        self.preview_images = []
+        self.preview_label.configure(image="", text="Sin vista previa")
+        self.preview_caption.configure(text="")
+        self.play_button.configure(state=tk.DISABLED)
+
+    def preview(self, side, explicit=False):
+        self.preview_timer = None
+        selected = self.trees[side].selection()
+        if len(selected) != 1:
+            return
+        entry = self.entries[side].get(selected[0])
+        if not entry or entry["directory"]:
+            return
+        extension = os.path.splitext(entry["name"])[1].lower()
+        if extension not in self.IMAGE_EXTENSIONS | self.VIDEO_EXTENSIONS:
+            self.preview_label.configure(text="Formato sin vista previa")
+            return
+        if side == "remote" and entry["size"] > 32 * 1024 * 1024:
+            self.preview_label.configure(text="Archivo grande: vista previa manual")
+            if not explicit or not messagebox.askyesno("Vista previa", f"Se descargará una copia temporal de "
+                    f"{self.size_text(entry['size'])}. ¿Continuar?", parent=self.window):
+                return
+        self.preview_token += 1
+        token = self.preview_token
+        self.clear_preview()
+        self.preview_label.configure(text="Cargando vista previa...")
+        self.preview_caption.configure(text=entry["name"])
+        if self.preview_future:
+            self.preview_future.cancel()
+
+        def work():
+            try:
+                from PIL import Image, ImageOps
+            except ImportError:
+                raise RuntimeError("La vista previa requiere Pillow. Instala: python -m pip install Pillow imageio-ffmpeg")
+            with tempfile.TemporaryDirectory(prefix="androidcontrol_preview_") as directory:
+                path = entry["path"]
+                if side == "remote":
+                    path = os.path.join(directory, "source" + extension)
+                    self.backend.run("pull", entry["path"], path, timeout=120)
+                if extension in self.IMAGE_EXTENSIONS:
+                    with Image.open(path) as image:
+                        image = ImageOps.exif_transpose(image)
+                        image.thumbnail((420, 240))
+                        return [image.convert("RGB").copy()], False
+                executable = shutil.which("ffmpeg")
+                if not executable:
+                    try:
+                        import imageio_ffmpeg
+                        executable = imageio_ffmpeg.get_ffmpeg_exe()
+                    except ImportError:
+                        raise RuntimeError("Los vídeos requieren FFmpeg o el paquete imageio-ffmpeg.")
+                result = subprocess.run([executable, "-nostdin", "-v", "error", "-i", path, "-t", "6", "-an",
+                                         "-vf", "fps=5,scale=420:240:force_original_aspect_ratio=decrease",
+                                         "-frames:v", "30", os.path.join(directory, "frame%03d.png")],
+                                        capture_output=True, timeout=60, **PROCESS_CREATION_OPTIONS)
+                if result.returncode:
+                    raise RuntimeError(result.stderr.decode("utf-8", "replace")[:400])
+                frames = []
+                for name in sorted(os.listdir(directory)):
+                    if name.startswith("frame") and name.endswith(".png"):
+                        with Image.open(os.path.join(directory, name)) as image:
+                            frames.append(image.convert("RGB").copy())
+                if not frames:
+                    raise RuntimeError("El vídeo no contiene fotogramas compatibles.")
+                return frames, True
+
+        def completed(result, error):
+            if token != self.preview_token:
+                return
+            if error:
+                self.preview_label.configure(text="Vista previa no disponible")
+                self.preview_caption.configure(text=error)
+                return
+            images, video = result
+            self.preview_images = images
+            self.frame_index = 0
+            self.playing = True
+            self.preview_caption.configure(text=entry["name"] + (" | Fragmento de 6 s, sin sonido" if video else ""))
+            self.play_button.configure(state=tk.NORMAL if video else tk.DISABLED, text="Pausar")
+            self.render_preview()
+
+        self.preview_future = self.submit(work, completed, self.preview_executor)
+
+    def resize_preview(self, event=None):
+        if self.preview_resize_timer:
+            self.window.after_cancel(self.preview_resize_timer)
+        self.preview_resize_timer = self.window.after(100, self.render_preview)
+
+    def render_preview(self):
+        self.preview_resize_timer = None
+        width = max(1, self.preview_label.winfo_width() - 8)
+        height = max(1, self.preview_label.winfo_height() - 8)
+        self.preview_caption.configure(wraplength=max(100, width))
+        if not self.preview_images:
+            return
+        from PIL import ImageTk
+        if self.animation_timer:
+            self.window.after_cancel(self.animation_timer)
+            self.animation_timer = None
+        frames = []
+        for original in self.preview_images:
+            image = original.copy()
+            image.thumbnail((width, height))
+            frames.append(ImageTk.PhotoImage(image, master=self.window))
+        self.frames = frames
+        self.animate()
+
+    def animate(self):
+        self.animation_timer = None
+        if not self.frames:
+            return
+        self.preview_label.configure(image=self.frames[self.frame_index], text="")
+        if len(self.frames) > 1 and self.playing:
+            self.frame_index = (self.frame_index + 1) % len(self.frames)
+            self.animation_timer = self.window.after(200, self.animate)
+
+    def toggle_play(self):
+        self.playing = not self.playing
+        self.play_button.configure(text="Pausar" if self.playing else "Reproducir")
+        if self.playing and self.animation_timer is None:
+            self.animate()
+
+    def poll(self):
+        if self.closed:
+            return
+        for index in range(20):
+            try:
+                callback, result, error = self.events.get_nowait()
+            except queue.Empty:
+                break
+            callback(result, error)
+        self.window.after(80, self.poll)
+
+    def close(self):
+        if self.active:
+            messagebox.showwarning("Transferencia en curso", "Espera a que termine el archivo activo.", parent=self.window)
+            return
+        if self.pending and not messagebox.askyesno("Cerrar gestor", "¿Cancelar las transferencias pendientes?", parent=self.window):
+            return
+        self.closed = True
+        self.preview_token += 1
+        if self.preview_timer:
+            self.window.after_cancel(self.preview_timer)
+        if self.preview_resize_timer:
+            self.window.after_cancel(self.preview_resize_timer)
+        self.clear_preview()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.preview_executor.shutdown(wait=False, cancel_futures=True)
+        self.window.destroy()
 
 
 class MobileDiagnostics:
@@ -489,37 +1084,8 @@ class ADBScrcpyApp:
         tab_files = ttk.Frame(notebook, padding=8)
         notebook.add(tab_files, text="📁 Transferencia Archivos & APKs")
 
-        send_frame = ttk.LabelFrame(tab_files, text=" 📤 Enviar Archivo o Instalar APK (PC ➔ Móvil) ", padding=6)
-        send_frame.pack(fill=tk.X, pady=(0, 6))
-
-        send_btn_row = ttk.Frame(send_frame)
-        send_btn_row.pack(fill=tk.X, pady=2)
-        ttk.Button(send_btn_row, text="📁 Seleccionar y Enviar Archivo (/sdcard/Download)", command=self.push_file_to_android).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        ttk.Button(send_btn_row, text="📦 Instalar APK de PC", command=self.install_apk_from_pc).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
-
-        pull_frame = ttk.LabelFrame(tab_files, text=" 📥 Descargar Archivos (Móvil ➔ PC) ", padding=6)
-        pull_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-
-        pull_top = ttk.Frame(pull_frame)
-        pull_top.pack(fill=tk.X, pady=2)
-        ttk.Label(pull_top, text="Ruta Android:", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 4))
-        self.remote_path_entry = ttk.Entry(pull_top, font=("Consolas", 9))
-        self.remote_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self.remote_path_entry.insert(0, "/sdcard/Download")
-
-        ttk.Button(pull_top, text="🔍 Listar", width=8, command=self.list_remote_files).pack(side=tk.RIGHT)
-
-        list_sub = ttk.Frame(pull_frame)
-        list_sub.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        self.file_listbox = tk.Listbox(list_sub, font=("Consolas", 8), bg="#1e1e1e", fg="#d4d4d4")
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        file_scroll = ttk.Scrollbar(list_sub, orient=tk.VERTICAL, command=self.file_listbox.yview)
-        file_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_listbox.configure(yscrollcommand=file_scroll.set)
-
-        ttk.Button(pull_frame, text="⬇️ Descargar Selección al PC", command=self.pull_selected_file).pack(fill=tk.X, pady=2)
+        ttk.Button(tab_files, text="Abrir gestor de archivos", command=self.open_file_manager).pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(tab_files, text="📦 Instalar APK de PC", command=self.install_apk_from_pc).pack(fill=tk.X)
 
         # --- TAB 3: NOTIFICACIONES Y LOGS ---
         tab_notif = ttk.Frame(notebook, padding=8)
@@ -603,11 +1169,7 @@ class ADBScrcpyApp:
         info_win.geometry("640x680")
         info_win.transient(self.root)
 
-        # Centrar ventana secundaria
-        info_win.update_idletasks()
-        x = max(0, self.root.winfo_x() + (self.root.winfo_width() // 2) - (640 // 2))
-        y = max(0, self.root.winfo_y() + (self.root.winfo_height() // 2) - (680 // 2))
-        info_win.geometry(f"640x680+{x}+{y}")
+        center_popup(info_win, 640, 680)
 
         status_bar = ttk.Label(info_win, text="⏳ Obteniendo especificaciones del dispositivo...", font=("Segoe UI", 10, "bold"), padding=8)
         status_bar.pack(side=tk.TOP, fill=tk.X)
@@ -786,6 +1348,7 @@ class ADBScrcpyApp:
         window.title("Estado del móvil")
         window.geometry("760x600")
         window.minsize(640, 450)
+        center_popup(window, 760, 600)
         window.transient(self.root)
         status = ttk.Label(window, text="Preparando análisis...", padding=10, wraplength=610)
         status.pack(fill=tk.X)
@@ -873,10 +1436,7 @@ class ADBScrcpyApp:
         debloat_win.geometry("620x680")
         debloat_win.transient(self.root)
 
-        debloat_win.update_idletasks()
-        x = max(0, self.root.winfo_x() + (self.root.winfo_width() // 2) - (620 // 2))
-        y = max(0, self.root.winfo_y() + (self.root.winfo_height() // 2) - (680 // 2))
-        debloat_win.geometry(f"620x680+{x}+{y}")
+        center_popup(debloat_win, 620, 680)
 
         title_lbl = ttk.Label(debloat_win, text="🧹 Optimización & Debloat Seguro (POCO X6 Pro)", font=("Segoe UI", 11, "bold"), padding=10)
         title_lbl.pack(anchor="w")
@@ -1030,26 +1590,19 @@ class ADBScrcpyApp:
         ttk.Button(btn_box, text="↺ Recuperar desde Punto de Restauración", command=execute_restore).pack(side=tk.RIGHT, padx=4)
 
     # --- TRANSFERENCIA DE ARCHIVOS Y PORTAPAPELES ---
-    def push_file_to_android(self):
-        file_path = filedialog.askopenfilename(title="Seleccionar archivo para enviar al móvil")
-        if not file_path:
+    def open_file_manager(self):
+        if not self.current_connected_device:
+            messagebox.showwarning("Sin dispositivo", "Conecta el móvil para gestionar sus archivos.")
             return
-
-        def task():
-            try:
-                filename = os.path.basename(file_path)
-                remote_dest = f"/sdcard/Download/{filename}"
-                self.log(f"Enviando archivo {filename} a {remote_dest}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "push", file_path, remote_dest], capture_output=True, text=True, timeout=30, **PROCESS_CREATION_OPTIONS)
-                if res.returncode == 0:
-                    self.log(f"✅ Archivo enviado con éxito: {filename}")
-                    messagebox.showinfo("Envío Correcto", f"Archivo enviado a:\n{remote_dest}")
-                else:
-                    self.log(f"❌ Error al enviar archivo: {res.stderr}")
-            except Exception as e:
-                self.log(f"Error al enviar: {e}")
-
-        threading.Thread(target=task, daemon=True).start()
+        manager = getattr(self, "_file_manager", None)
+        if manager and not manager.closed:
+            if manager.backend.device == self.current_connected_device:
+                manager.window.lift()
+                return
+            manager.close()
+            if not manager.closed:
+                return
+        self._file_manager = FileTransferWindow(self)
 
     def install_apk_from_pc(self):
         file_path = filedialog.askopenfilename(title="Seleccionar APK para instalar", filetypes=[("Android Packages", "*.apk")])
@@ -1067,59 +1620,6 @@ class ADBScrcpyApp:
                     self.log(f"❌ Error de instalación: {res.stdout or res.stderr}")
             except Exception as e:
                 self.log(f"Error instalando APK: {e}")
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def list_remote_files(self):
-        remote_path = self.remote_path_entry.get().strip()
-        def task():
-            try:
-                self.log(f"Listando archivos en {remote_path}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "shell", "ls", "-1", remote_path], capture_output=True, text=True, timeout=5, **PROCESS_CREATION_OPTIONS)
-                if res.returncode == 0:
-                    files = [f.strip() for f in res.stdout.strip().split("\n") if f.strip()]
-                    self.root.after(0, lambda: self._update_file_listbox(files))
-                    self.log(f"Encontrados {len(files)} elementos.")
-                else:
-                    self.log(f"Error listando directorio: {res.stderr}")
-            except Exception as e:
-                self.log(f"Error al listar: {e}")
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def _update_file_listbox(self, files):
-        self.file_listbox.delete(0, tk.END)
-        for f in files:
-            self.file_listbox.insert(tk.END, f)
-
-    def pull_selected_file(self):
-        sel = self.file_listbox.curselection()
-        if not sel:
-            messagebox.showwarning("Selección vacía", "Selecciona un archivo de la lista para descargar.")
-            return
-
-        selected_filename = self.file_listbox.get(sel[0])
-        remote_path = self.remote_path_entry.get().strip()
-        full_remote_file = f"{remote_path.rstrip('/')}/{selected_filename}"
-
-        dest_dir = filedialog.askdirectory(title="Seleccionar carpeta de destino en PC", initialdir=self.config.get("last_pc_pull_dir"))
-        if not dest_dir:
-            return
-
-        self.config["last_pc_pull_dir"] = dest_dir
-        self.save_current_settings()
-
-        def task():
-            try:
-                self.log(f"Descargando {selected_filename} a {dest_dir}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "pull", full_remote_file, dest_dir], capture_output=True, text=True, timeout=60, **PROCESS_CREATION_OPTIONS)
-                if res.returncode == 0:
-                    self.log(f"✅ Descarga completada: {selected_filename}")
-                    messagebox.showinfo("Descarga Exitosa", f"Archivo guardado en:\n{dest_dir}")
-                else:
-                    self.log(f"❌ Error al descargar: {res.stderr}")
-            except Exception as e:
-                self.log(f"Error al descargar: {e}")
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -1189,6 +1689,11 @@ class ADBScrcpyApp:
     def real_exit(self):
         if self._is_closing:
             return
+        manager = getattr(self, "_file_manager", None)
+        if manager and not manager.closed:
+            manager.close()
+            if not manager.closed:
+                return
         self._is_closing = True
         try:
             self.save_current_settings()
@@ -1397,14 +1902,7 @@ class ADBScrcpyApp:
         cast_win = tk.Toplevel(self.root)
         cast_win.title("Castear pantalla del PC")
         cast_win.transient(self.root)
-        cast_win.update_idletasks()
-        width = 460
-        height = 250
-        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
-        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
-        x = min(x, max(0, cast_win.winfo_screenwidth() - width))
-        y = min(y, max(0, cast_win.winfo_screenheight() - height))
-        cast_win.geometry(f"{width}x{height}+{x}+{y}")
+        center_popup(cast_win, 460, 250)
         cast_win.grab_set()
 
         ttk.Label(
