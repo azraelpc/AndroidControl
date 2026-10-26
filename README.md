@@ -11,7 +11,9 @@ Tkinter y las herramientas externas ADB y scrcpy. En Linux, cerrar la ventana
 termina la aplicación; la bandeja del sistema y las notificaciones emergentes
 están disponibles solo en Windows.
 
-<img width="500" alt="image" src="https://github.com/user-attachments/assets/a492e765-e9b7-40e1-88d1-90f1ceebe6f5" /> <img width="475" alt="image" src="https://github.com/user-attachments/assets/fb7ffae3-2061-4b9b-bdb6-449e371d78c9" />
+<img width="900" alt="image" src="https://github.com/user-attachments/assets/a492e765-e9b7-40e1-88d1-90f1ceebe6f5" />
+<img width="900" alt="image" src="https://github.com/user-attachments/assets/5ef66aba-5b44-43cc-983c-724db5a01cbf" />
+<img width="475" alt="image" src="https://github.com/user-attachments/assets/fb7ffae3-2061-4b9b-bdb6-449e371d78c9" />
 
 
 ## Funciones
