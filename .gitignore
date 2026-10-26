@@ -1,0 +1,23 @@
+# Local settings may contain device addresses, PINs, or personal paths.
+androidcontrol_config.json
+
+# Device-specific debloat manifests and restoration metadata.
+Punto_de_Restauracion_*/
+
+# Screenshots created by the application.
+screenshot_*.png
+
+# Python cache and virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets and environment overrides.
+.env
+.env.*
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
