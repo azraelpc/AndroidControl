@@ -6,6 +6,8 @@ import time
 import ctypes
 import json
 import shutil
+import queue
+import re
 
 # --- FLAGS DE CREACIÓN PARA EVITAR CONSOLAS DE CMD EN WINDOWS ---
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -56,6 +58,65 @@ SAFE_POCO_BLOATWARE = [
     ("com.google.android.music", "YouTube Music System Stub"),
     ("com.google.android.apps.subscriptions.redium", "Google One")
 ]
+
+DIAGNOSTIC_SETTINGS = (
+    "window_animation_scale", "transition_animation_scale", "animator_duration_scale",
+    "stay_on_while_plugged_in", "always_finish_activities"
+)
+
+
+class MobileDiagnostics:
+    def __init__(self, device, runner=subprocess.run):
+        if not device:
+            raise ValueError("No hay dispositivo seleccionado.")
+        self.device = device
+        self.runner = runner
+
+    def adb(self, *args):
+        result = self.runner(
+            ["adb", "-s", self.device, "shell", *args], capture_output=True,
+            text=True, timeout=12, **PROCESS_CREATION_OPTIONS
+        )
+        output = result.stdout.strip()
+        if result.returncode or result.stderr.strip() or re.search(
+                r"exception|permission denial|error:|unknown command", output, re.I):
+            raise RuntimeError(result.stderr.strip() or output or "Fallo de ADB.")
+        return output
+
+    def identity(self):
+        identity = {key: self.adb("getprop", prop) for key, prop in (
+            ("serial", "ro.serialno"), ("build", "ro.build.fingerprint"),
+            ("model", "ro.product.model"), ("device", "ro.product.device"),
+            ("brand", "ro.product.brand"))}
+        identity["user"] = self.adb("am", "get-current-user")
+        return identity
+
+    def analyze(self):
+        identity = self.identity()
+        notes = []
+        for key in DIAGNOSTIC_SETTINGS:
+            try:
+                value = self.adb("settings", "get", "global", key)
+                notes.append(f"{key}: {value if value and value != 'null' else 'sin valor definido'}")
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
+                notes.append(f"{key}: no disponible ({error})")
+        for title, command in (
+            ("Bateria (temperatura en decimas de grado)", ("dumpsys", "battery")),
+            ("Memoria (kB; RAM libre no equivale a rendimiento)", ("cat", "/proc/meminfo")),
+            ("Almacenamiento /data (kB)", ("df", "-k", "/data"))
+        ):
+            try:
+                output = self.adb(*command)
+                if command[0] == "cat":
+                    output = "\n".join(line for line in output.splitlines()
+                                       if line.startswith(("MemTotal:", "MemAvailable:")))
+                notes.append(f"\n{title}:\n{output}")
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
+                notes.append(f"{title}: no disponible ({error})")
+        if self.identity() != identity:
+            raise RuntimeError("El dispositivo o usuario cambio durante el analisis.")
+        return {"identity": identity, "notes": notes}
+
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -574,6 +635,7 @@ class ADBScrcpyApp:
         copy_btn.pack(side=tk.RIGHT, padx=4)
 
         debloat_btn = ttk.Button(btn_box, text="⚡ Advanced: Debloat", command=lambda: self.open_debloat_poco_dialog(info_win))
+        diagnostics_btn = ttk.Button(btn_box, text="Analizar estado", command=self.open_mobile_diagnostics_dialog)
 
         def fetch_and_populate():
             info_data = {}
@@ -688,6 +750,7 @@ class ADBScrcpyApp:
 
                     if is_poco_duchamp:
                         debloat_btn.pack(side=tk.LEFT, padx=4)
+                        diagnostics_btn.pack(side=tk.LEFT, padx=4)
 
                 info_win.after(0, update_tree)
 
@@ -707,6 +770,96 @@ class ADBScrcpyApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(report_text)
         messagebox.showinfo("Reporte Copiado", "El informe de especificaciones se ha copiado al portapapeles.")
+
+    def open_mobile_diagnostics_dialog(self):
+        existing = getattr(self, "_diagnostics_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+        if not self.current_connected_device:
+            messagebox.showwarning("Sin dispositivo", "Conecta el móvil antes de analizarlo.")
+            return
+
+        diagnostics = MobileDiagnostics(self.current_connected_device)
+        window = tk.Toplevel(self.root)
+        self._diagnostics_window = window
+        window.title("Estado del móvil")
+        window.geometry("760x600")
+        window.minsize(640, 450)
+        window.transient(self.root)
+        status = ttk.Label(window, text="Preparando análisis...", padding=10, wraplength=610)
+        status.pack(fill=tk.X)
+        report_frame = ttk.Frame(window)
+        report_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        report = tk.Text(report_frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
+        report_scroll = ttk.Scrollbar(report_frame, orient=tk.VERTICAL, command=report.yview)
+        report.configure(yscrollcommand=report_scroll.set)
+        report.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        report_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        actions = ttk.Frame(window, padding=10)
+        actions.pack(fill=tk.X)
+        events = queue.Queue()
+        state = {"busy": False}
+
+        def set_report(text):
+            report.configure(state=tk.NORMAL)
+            report.delete("1.0", tk.END)
+            report.insert("1.0", text)
+            report.configure(state=tk.DISABLED)
+
+        def refresh_controls():
+            available = not state["busy"]
+            analyze_button.configure(state=tk.NORMAL if available else tk.DISABLED)
+
+        def analyze():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            refresh_controls()
+            set_report("")
+            status.configure(text="Consultando el estado del móvil...")
+
+            def worker():
+                try:
+                    events.put((diagnostics.analyze(), None))
+                except Exception as error:
+                    events.put((None, str(error)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        analyze_button = ttk.Button(actions, text="Analizar de nuevo", command=analyze)
+        analyze_button.pack(side=tk.LEFT, padx=3)
+
+        def close():
+            if state["busy"]:
+                messagebox.showwarning("Operación en curso", "Espera a que finalice la operación.", parent=window)
+                return
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close)
+
+        def poll():
+            if not window.winfo_exists():
+                return
+            try:
+                result, error = events.get_nowait()
+            except queue.Empty:
+                window.after(100, poll)
+                return
+            state["busy"] = False
+            if error:
+                status.configure(text="No se pudo completar el análisis.")
+                self.log(f"Diagnóstico: {error}")
+                messagebox.showerror("Diagnóstico", error, parent=window)
+            else:
+                identity = result["identity"]
+                status.configure(text=f"{identity['brand']} {identity['model']} ({identity['device']})")
+                set_report("\n".join(result["notes"]))
+            refresh_controls()
+            window.after(100, poll)
+
+        window.after(100, poll)
+        analyze()
 
     # --- DEBLOAT Y RESTAURACIÓN SAFE PARA POCO X6 PRO (duchamp) ---
     def open_debloat_poco_dialog(self, parent_win):

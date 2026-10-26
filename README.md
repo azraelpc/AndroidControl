@@ -38,6 +38,34 @@ están disponibles solo en Windows.
 - **Debloat opcional:** en dispositivos detectados como Xiaomi/POCO ofrece una
   lista seleccionable de paquetes para desinstalarlos para el usuario actual y
   permite volver a habilitarlos desde un punto de restauración.
+- **Análisis de estado:** junto al debloat y con la misma detección existente,
+  consulta el estado del móvil sin modificar ajustes ni proponer optimizaciones.
+
+## Análisis de estado
+
+Abre **Información del dispositivo** y pulsa **Analizar estado** cuando aparezca
+junto al botón de debloat. Se conserva la detección Xiaomi/POCO existente.
+El informe consulta batería, temperatura, RAM disponible, almacenamiento y los
+valores actuales de las escalas de animación, mantener despierto al cargar y
+no mantener actividades. **Analizar de nuevo** actualiza las lecturas.
+
+Este diagnóstico es exclusivamente de lectura: no aplica ni restaura ajustes,
+no crea puntos de restauración y no modifica swap, zRAM, extensión de memoria,
+servicios, aplicaciones ni datos. Las lecturas que Android no permita consultar
+se indican como no disponibles. El debloat y sus puntos de restauración siguen
+siendo una función independiente y opcional, sin cambios.
+
+No se ofrece una optimización general porque reducir animaciones solo acorta
+esperas visuales y cambiar preferencias no garantiza más rendimiento. Tener
+poca RAM libre tampoco justifica vaciarla: Android conserva aplicaciones en
+memoria para reutilizarlas. Referencias oficiales:
+
+- [Android Settings.Global](https://developer.android.com/reference/android/provider/Settings.Global).
+- [Opciones de desarrollador](https://developer.android.com/studio/debug/dev-options).
+- [Gestión de memoria de Android](https://developer.android.com/topic/performance/memory-management).
+
+Todo el código de la aplicación, incluido el diagnóstico, está integrado en
+`androidcontrol.pyw`; no necesita módulos locales ni archivos de pruebas auxiliares.
 
 ## Requisitos e instalación
 
