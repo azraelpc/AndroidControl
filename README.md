@@ -1,15 +1,15 @@
 # Android Control Center
 
-Aplicación de escritorio para Windows que reúne en una interfaz gráfica varias
-funciones de Android Debug Bridge (ADB) y scrcpy. Permite conectar un teléfono
-Android por USB o Wi-Fi, controlarlo y reflejar su pantalla, transferir
+Aplicación de escritorio para Windows y Linux que reúne en una interfaz gráfica
+varias funciones de Android Debug Bridge (ADB) y scrcpy. Permite conectar un
+teléfono Android por USB o Wi-Fi, controlarlo y reflejar su pantalla, transferir
 archivos, instalar APK y consultar información del dispositivo.
 
 La aplicación está escrita en Python y utiliza Tkinter para la interfaz. No
-requiere paquetes de Python de terceros; sí necesita Python 3.12 o posterior,
-Tkinter y las herramientas externas ADB y scrcpy. **La interfaz actual solo es
-compatible con Windows**: aunque ADB y scrcpy también se pueden instalar en
-Linux, el programa usa APIs de Windows y no se ejecuta allí.
+requiere paquetes de Python de terceros; sí necesita Python 3.10 o posterior,
+Tkinter y las herramientas externas ADB y scrcpy. En Linux, cerrar la ventana
+termina la aplicación; la bandeja del sistema y las notificaciones emergentes
+están disponibles solo en Windows.
 
 ## Funciones
 
@@ -18,6 +18,9 @@ Linux, el programa usa APIs de Windows y no se ejecuta allí.
   Android 11 o posterior.
 - **Control y espejo:** inicia y detiene scrcpy, con opciones para mantener el
   teléfono despierto y apagar su pantalla física durante el espejo.
+- **Cast a TV:** abre Google Chrome para emitir el escritorio a receptores
+  Google Cast, o el selector Miracast del sistema cuando esté disponible.
+  Mantén la ventana de scrcpy visible en el escritorio compartido.
 - **Controles del teléfono:** envía acciones de inicio, atrás, aplicaciones
   recientes, encendido, volumen y reproducción multimedia.
 - **Capturas y portapapeles:** guarda capturas de pantalla en la carpeta del
@@ -28,10 +31,10 @@ Linux, el programa usa APIs de Windows y no se ejecuta allí.
 - **Transferencia e instalación:** envía archivos a `/sdcard/Download`, lista y
   descarga archivos de una ruta del móvil e instala APK desde el PC.
 - **Notificaciones y registro:** puede supervisar determinados mensajes de
-  `logcat` y mostrarlos en el área de notificación de Windows. Incluye un
-  registro de actividad en la aplicación.
-- **Bandeja del sistema:** al cerrar la ventana, la aplicación se minimiza a la
-  bandeja; desde su menú contextual se puede restaurar o salir.
+  `logcat`; muestra avisos emergentes en Windows y registra actividad dentro de
+  la aplicación en ambos sistemas.
+- **Bandeja del sistema (Windows):** al cerrar la ventana, la aplicación se
+  minimiza a la bandeja; desde su menú contextual se puede restaurar o salir.
 - **Debloat opcional:** en dispositivos detectados como Xiaomi/POCO ofrece una
   lista seleccionable de paquetes para desinstalarlos para el usuario actual y
   permite volver a habilitarlos desde un punto de restauración.
@@ -40,7 +43,7 @@ Linux, el programa usa APIs de Windows y no se ejecuta allí.
 
 ### Windows (ejecutar la aplicación)
 
-Necesitas Windows 10/11, Python 3.12 o posterior con Tcl/Tk, ADB, scrcpy y un
+Necesitas Windows 10/11, Python 3.10 o posterior con Tcl/Tk, ADB, scrcpy y un
 dispositivo Android con la depuración USB o inalámbrica habilitada.
 
 **Opción sencilla: instalar desde WinGet.** Abre PowerShell y ejecuta:
@@ -75,6 +78,10 @@ extrae la carpeta `platform-tools` y añádela a `PATH`. Si Python se instaló s
 Tkinter, vuelve a ejecutar el instalador oficial y habilita **Tcl/Tk and IDLE**
 en las opciones de instalación.
 
+Google Chrome es opcional para el resto de la aplicación, pero necesario para
+usar el botón de Google Cast. Puedes instalarlo desde
+[google.com/chrome](https://www.google.com/chrome/).
+
 Descarga o clona el repositorio y ejecuta `androidcontrol.pyw` con doble clic.
 También puedes iniciarlo desde PowerShell:
 
@@ -88,33 +95,42 @@ Para ver los mensajes de error en una terminal, utiliza:
 py .\androidcontrol.pyw
 ```
 
-### Linux (herramientas ADB y scrcpy)
+### Linux
 
-**Android Control Center todavía no se ejecuta en Linux** porque su interfaz y
-su bandeja del sistema dependen de APIs de Windows. Los siguientes comandos
-instalan las herramientas para usar ADB y scrcpy directamente desde Linux; no
-habilitan la aplicación gráfica.
-
-En Debian o Ubuntu, abre una terminal y ejecuta:
+En Debian o Ubuntu, instala Python, Tkinter, ADB y scrcpy desde la terminal:
 
 ```bash
-sudo apt update && sudo apt install adb scrcpy
+sudo apt update && sudo apt install python3 python3-tk adb scrcpy
 ```
 
-En otras distribuciones, instala `adb` y `scrcpy` con el gestor de paquetes de
-tu sistema. Consulta las instrucciones oficiales de
+La aplicación necesita Python **3.10 o posterior**. Comprueba la versión con
+`python3 --version`; si la distribución instala una versión anterior, instala
+Python 3.10+ desde los repositorios oficiales de esa distribución antes de
+continuar. En otras distribuciones, instala `python3` (3.10+), Tkinter, `adb` y
+`scrcpy` mediante el gestor de paquetes correspondiente. Consulta las instrucciones oficiales de
 [instalación de scrcpy en Linux](https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md).
 Los paquetes de la distribución pueden ofrecer una versión anterior; la misma
 guía incluye opciones oficiales para obtener una versión más reciente.
 
-Si necesitas Python y Tkinter para desarrollar o adaptar el proyecto, en
-Debian/Ubuntu puedes instalarlos con:
+Descarga o clona el repositorio y, desde su carpeta, ejecuta:
 
 ```bash
-sudo apt install python3 python3-tk
+python3 androidcontrol.pyw
 ```
 
-Esto no elimina la incompatibilidad actual de la aplicación con Linux.
+No hace falta instalar paquetes con `pip`. En algunas distribuciones puede ser
+necesario configurar permisos USB/udev para que tu usuario pueda acceder al
+teléfono; sigue las instrucciones de Android o de tu distribución y vuelve a
+conectar el dispositivo después de cambiar permisos.
+
+Para la opción Miracast, instala también **GNOME Network Displays** desde los
+repositorios de tu distribución si está disponible. Es opcional y requiere un
+escritorio/controlador Wi-Fi compatible con Miracast.
+
+Para Google Cast, instala Google Chrome para Linux desde
+[google.com/chrome](https://www.google.com/chrome/). Algunos paquetes de
+Chromium no incluyen el soporte Google Cast; por eso la aplicación busca
+Google Chrome para esa opción.
 
 ### Comprobar la instalación
 
@@ -134,7 +150,7 @@ adb version
 scrcpy --version
 ```
 
-Python debe informar la versión 3.12 o posterior. Si un comando no se reconoce,
+Python debe informar la versión 3.10 o posterior. Si un comando no se reconoce,
 reabre la terminal; si sigue sin aparecer, comprueba el `PATH` o instala la
 herramienta que falta desde los enlaces anteriores. En Linux, los paquetes
 Python se obtienen con el gestor de paquetes de la distribución; no se requiere
@@ -197,6 +213,36 @@ El botón de desbloqueo utiliza ADB para encender y deslizar la pantalla y, si s
 ha guardado un PIN, escribirlo. Su comportamiento depende del bloqueo y la
 configuración del teléfono; no sustituye la autorización de ADB ni garantiza
 desbloquear todos los dispositivos.
+
+### Castear scrcpy a una TV
+
+En **Control & Espejo**, pulsa **Castear pantalla del PC a una TV**. Se abrirá
+un diálogo centrado sobre la ventana principal; elige ahí el protocolo que
+corresponda a tu receptor:
+
+- **Google Cast (Chromecast / Google TV):** la aplicación abre Google Chrome.
+  Desde el menú del navegador, selecciona **Transmitir/Cast**, elige la fuente
+  **Transmitir pantalla** y selecciona la TV.
+- **Miracast:** en Windows se abre el selector de pantalla inalámbrica
+  (**Win+K**). En Linux se inicia **GNOME Network Displays**, si está instalado.
+
+Esta función transmite el **escritorio completo del PC**, no únicamente la
+ventana de scrcpy. Deja scrcpy visible en el escritorio o monitor que compartas.
+La selección y conexión a la TV se confirman en Chrome o en el panel del
+sistema, no dentro de AndroidControl. El audio recibido por la TV depende del
+protocolo, navegador y sistema operativo; comprueba que el sonido de scrcpy se
+está reproduciendo y compartiendo desde el PC.
+
+Chromecast/Google TV necesita que el navegador tenga disponible Google Cast;
+en Linux, la compatibilidad de Cast depende de la distribución y del paquete de
+Chrome/Chromium. Miracast requiere compatibilidad tanto del PC y su adaptador
+inalámbrico como del televisor/receptor. Algunos dispositivos vendidos como
+AnyCast funcionan como Miracast, mientras que otros ofrecen AirPlay o DLNA, que
+no son intercambiables; AndroidControl no garantiza compatibilidad con todos
+ellos. Mantén el PC y la TV en la red o modo inalámbrico requerido por el
+receptor (Google Cast suele requerir la misma red local; Miracast suele usar
+Wi-Fi Direct). Al compartir el escritorio, otras ventanas visibles también
+podrían aparecer en la TV.
 
 ### Transferencia de archivos y APK
 
@@ -269,8 +315,8 @@ al equipo. No compartas `androidcontrol_config.json`.
 - **No conecta por Wi-Fi:** comprueba que el PC y el teléfono estén en la misma
   red, que la depuración inalámbrica siga activa y que estés usando el puerto
   vigente que muestra Android.
-- **La aplicación no inicia:** confirma que estás usando Python 3.12 o posterior
-  con Tkinter habilitado.
+- **La aplicación no inicia:** confirma que estás usando Python 3.10 o posterior
+  con Tkinter habilitado (`python3-tk` en Debian/Ubuntu).
 - **El espejo no se inicia:** comprueba primero que `scrcpy --version` funciona
   desde la misma terminal y que ADB detecta el teléfono.
 

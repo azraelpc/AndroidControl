@@ -9,6 +9,8 @@ import shutil
 
 # --- FLAGS DE CREACIÓN PARA EVITAR CONSOLAS DE CMD EN WINDOWS ---
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+IS_WINDOWS = sys.platform == "win32"
+PROCESS_CREATION_OPTIONS = {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
 
 # --- RESOLUCIÓN DE RUTAS PARA AUTORUN / STARTUP ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,29 +77,30 @@ def save_config(config_dict):
         pass
 
 # --- INSTANCIA ÚNICA (SINGLE INSTANCE LOCK USING WINDOWS MUTEX) ---
-MUTEX_NAME = "Local\\AndroidControlCenterSingleInstanceMutex"
-kernel32 = ctypes.windll.kernel32
-mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
-last_error = kernel32.GetLastError()
-ERROR_ALREADY_EXISTS = 183
+if IS_WINDOWS:
+    MUTEX_NAME = "Local\\AndroidControlCenterSingleInstanceMutex"
+    kernel32 = ctypes.windll.kernel32
+    mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    last_error = kernel32.GetLastError()
+    ERROR_ALREADY_EXISTS = 183
 
-if last_error == ERROR_ALREADY_EXISTS:
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            0, 
-            "El programa 'Android Control Center' ya se encuentra en ejecución.\nRevisa la bandeja del sistema (al lado del reloj).", 
-            "Instancia única", 
-            0x40 | 0x1
-        )
-    except Exception:
-        pass
-    sys.exit(0)
+    if last_error == ERROR_ALREADY_EXISTS:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "El programa 'Android Control Center' ya se encuentra en ejecución.\nRevisa la bandeja del sistema (al lado del reloj).",
+                "Instancia única",
+                0x40 | 0x1
+            )
+        except Exception:
+            pass
+        sys.exit(0)
 
 # --- COMPROBACIÓN PREVIA DE DEPENDENCIAS DE PYTHON ---
 REQUIRED_MODULES = {
-    "tkinter": "Interfaz gráfica (viene por defecto con Python en Windows).",
+    "tkinter": "Interfaz gráfica (en Linux suele instalarse como paquete python3-tk).",
     "subprocess": "Gestión de comandos ADB y scrcpy.",
-    "ctypes": "Integración con la bandeja de sistema de Windows y notificaciones."
+    "ctypes": "Integración con el sistema operativo."
 }
 
 missing_modules = []
@@ -112,11 +115,12 @@ if missing_modules:
         "¡Atención!\n\n"
         "Faltan los siguientes módulos esenciales de Python:\n"
         f"• {', '.join(missing_modules)}\n\n"
-        "Asegúrate de instalar Python para Windows desde python.org."
+        "Instala los módulos indicados con el instalador de Python o el gestor "
+        "de paquetes de tu distribución."
     )
-    try:
+    if IS_WINDOWS:
         ctypes.windll.user32.MessageBoxW(0, error_msg, "Error de dependencias", 0x10)
-    except Exception:
+    else:
         print(error_msg)
     sys.exit(1)
 
@@ -139,7 +143,10 @@ GWLP_WNDPROC = -4
 ID_M_RESTORE = 1001
 ID_M_EXIT = 1002
 
-WNDPROC_TYPE = ctypes.WINFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
+WNDPROC_TYPE = (
+    ctypes.WINFUNCTYPE(ctypes.c_int64, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p)
+    if IS_WINDOWS else None
+)
 
 class POINT(ctypes.Structure):
     _fields_ = [
@@ -166,13 +173,14 @@ class NOTIFYICONDATAW(ctypes.Structure):
         ("hBalloonIcon", ctypes.c_void_p)
     ]
 
-SetWindowLongPtrW = getattr(ctypes.windll.user32, 'SetWindowLongPtrW', ctypes.windll.user32.SetWindowLongW)
-SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-SetWindowLongPtrW.restype = ctypes.c_void_p
+if IS_WINDOWS:
+    SetWindowLongPtrW = getattr(ctypes.windll.user32, 'SetWindowLongPtrW', ctypes.windll.user32.SetWindowLongW)
+    SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    SetWindowLongPtrW.restype = ctypes.c_void_p
 
-CallWindowProcW = ctypes.windll.user32.CallWindowProcW
-CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
-CallWindowProcW.restype = ctypes.c_int64
+    CallWindowProcW = ctypes.windll.user32.CallWindowProcW
+    CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+    CallWindowProcW.restype = ctypes.c_int64
 
 class WindowsTrayIcon:
     def __init__(self, app_instance, title="Android Control Center"):
@@ -269,8 +277,10 @@ class ADBScrcpyApp:
         self.center_window()
         self.root.update()
 
-        self.tray = WindowsTrayIcon(self)
-        self.tray.add_icon()
+        self.tray = None
+        if IS_WINDOWS:
+            self.tray = WindowsTrayIcon(self)
+            self.tray.add_icon()
 
         self.verify_external_tools()
 
@@ -295,10 +305,11 @@ class ADBScrcpyApp:
             missing.append("• scrcpy (Screen Mirroring tool)")
 
         if missing:
+            missing_tools = "\n".join(missing)
             msg = (
                 "⚠️ Advertencia de Herramientas Externas:\n\n"
                 "No se han encontrado en el PATH del sistema:\n"
-                f"{'\n'.join(missing)}\n\n"
+                f"{missing_tools}\n\n"
                 "Para un funcionamiento completo, asegúrate de tener estas herramientas "
                 "instaladas e incluidas en las variables de entorno (PATH)."
             )
@@ -366,6 +377,8 @@ class ADBScrcpyApp:
         self.start_mirror_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         self.stop_mirror_btn = ttk.Button(btn_frame, text="⏹ Detener Espejo", command=self.stop_scrcpy, state=tk.DISABLED)
         self.stop_mirror_btn.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
+
+        ttk.Button(mirror_frame, text="📺 Castear pantalla del PC a una TV", command=self.open_cast_dialog).pack(fill=tk.X, pady=(4, 2))
 
         opts_frame = ttk.Frame(mirror_frame)
         opts_frame.pack(fill=tk.X, pady=2)
@@ -511,7 +524,7 @@ class ADBScrcpyApp:
         cmd.extend(args)
         
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=CREATE_NO_WINDOW)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **PROCESS_CREATION_OPTIONS)
             return res.stdout.strip()
         except Exception:
             return ""
@@ -874,7 +887,7 @@ class ADBScrcpyApp:
                 filename = os.path.basename(file_path)
                 remote_dest = f"/sdcard/Download/{filename}"
                 self.log(f"Enviando archivo {filename} a {remote_dest}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "push", file_path, remote_dest], capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "push", file_path, remote_dest], capture_output=True, text=True, timeout=30, **PROCESS_CREATION_OPTIONS)
                 if res.returncode == 0:
                     self.log(f"✅ Archivo enviado con éxito: {filename}")
                     messagebox.showinfo("Envío Correcto", f"Archivo enviado a:\n{remote_dest}")
@@ -893,7 +906,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Instalando APK: {os.path.basename(file_path)}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "install", "-r", file_path], capture_output=True, text=True, timeout=60, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "install", "-r", file_path], capture_output=True, text=True, timeout=60, **PROCESS_CREATION_OPTIONS)
                 if "Success" in res.stdout:
                     self.log(f"✅ Aplicación instalada correctamente.")
                     messagebox.showinfo("Instalación Exitosa", "La APK se ha instalado correctamente en el teléfono.")
@@ -909,7 +922,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Listando archivos en {remote_path}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "shell", "ls", "-1", remote_path], capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "shell", "ls", "-1", remote_path], capture_output=True, text=True, timeout=5, **PROCESS_CREATION_OPTIONS)
                 if res.returncode == 0:
                     files = [f.strip() for f in res.stdout.strip().split("\n") if f.strip()]
                     self.root.after(0, lambda: self._update_file_listbox(files))
@@ -946,7 +959,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Descargando {selected_filename} a {dest_dir}...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "pull", full_remote_file, dest_dir], capture_output=True, text=True, timeout=60, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "pull", full_remote_file, dest_dir], capture_output=True, text=True, timeout=60, **PROCESS_CREATION_OPTIONS)
                 if res.returncode == 0:
                     self.log(f"✅ Descarga completada: {selected_filename}")
                     messagebox.showinfo("Descarga Exitosa", f"Archivo guardado en:\n{dest_dir}")
@@ -1000,6 +1013,10 @@ class ADBScrcpyApp:
             pass
 
     def hide_to_tray(self):
+        if not IS_WINDOWS:
+            self.real_exit()
+            return
+
         try:
             self.save_current_settings()
             self.root.withdraw()
@@ -1032,10 +1049,11 @@ class ADBScrcpyApp:
                     self.logcat_process.terminate()
                 except Exception:
                     pass
-            try:
-                self.tray.remove_icon()
-            except Exception:
-                pass
+            if self.tray is not None:
+                try:
+                    self.tray.remove_icon()
+                except Exception:
+                    pass
             self.root.destroy()
         except Exception:
             pass
@@ -1046,7 +1064,7 @@ class ADBScrcpyApp:
             if self._is_closing:
                 return
             try:
-                res = subprocess.run(["adb", "-s", self.current_connected_device or ""] + args, capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or ""] + args, capture_output=True, text=True, timeout=5, **PROCESS_CREATION_OPTIONS)
                 if self._is_closing:
                     return
                 if res.returncode == 0:
@@ -1065,7 +1083,7 @@ class ADBScrcpyApp:
             if self._is_closing:
                 return
             try:
-                res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3, **PROCESS_CREATION_OPTIONS)
                 if self._is_closing:
                     return
                 lines = res.stdout.strip().split("\n")[1:]
@@ -1110,7 +1128,7 @@ class ADBScrcpyApp:
             try:
                 if self._is_closing:
                     return
-                res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3, **PROCESS_CREATION_OPTIONS)
                 if self._is_closing:
                     return
                 lines = res.stdout.strip().split("\n")[1:]
@@ -1119,7 +1137,7 @@ class ADBScrcpyApp:
                 if not devices and self.is_auto_reconnect_enabled:
                     target = self.ip_entry.get().strip()
                     if target and target != "192.168.1.XX:5555":
-                        subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=3, creationflags=CREATE_NO_WINDOW)
+                        subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=3, **PROCESS_CREATION_OPTIONS)
                 
                 if not self._is_closing:
                     self.check_adb_connection()
@@ -1137,7 +1155,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log("Cambiando ADB a modo TCP/IP en puerto 5555...")
-                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "tcpip", "5555"], capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "-s", self.current_connected_device or "", "tcpip", "5555"], capture_output=True, text=True, timeout=5, **PROCESS_CREATION_OPTIONS)
                 self.log(res.stdout.strip() or res.stderr.strip())
                 messagebox.showinfo("Modo TCP/IP", "ADB reiniciado en modo TCP/IP (puerto 5555).\nYa puedes desconectar el cable USB y conectar por Wi-Fi.")
             except Exception as e:
@@ -1153,7 +1171,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Conectando a dispositivo inalámbrico {target}...")
-                res = subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=6, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=6, **PROCESS_CREATION_OPTIONS)
                 out = res.stdout.strip()
                 self.log(out)
                 if "connected" in out:
@@ -1176,7 +1194,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Emparejando con {target}...")
-                res = subprocess.run(["adb", "pair", target, code], capture_output=True, text=True, timeout=8, creationflags=CREATE_NO_WINDOW)
+                res = subprocess.run(["adb", "pair", target, code], capture_output=True, text=True, timeout=8, **PROCESS_CREATION_OPTIONS)
                 out = res.stdout.strip()
                 self.log(out)
                 messagebox.showinfo("Resultado Emparejamiento", out)
@@ -1200,7 +1218,7 @@ class ADBScrcpyApp:
         def task():
             try:
                 self.log(f"Lanzando: {' '.join(cmd)}")
-                self.scrcpy_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
+                self.scrcpy_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **PROCESS_CREATION_OPTIONS)
                 self.root.after(0, lambda: self.start_mirror_btn.config(state=tk.DISABLED))
                 self.root.after(0, lambda: self.stop_mirror_btn.config(state=tk.NORMAL))
                 
@@ -1221,6 +1239,135 @@ class ADBScrcpyApp:
         if self.scrcpy_process and self.scrcpy_process.poll() is None:
             self.scrcpy_process.terminate()
             self.log("scrcpy finalizado.")
+
+    def open_cast_dialog(self):
+        cast_win = tk.Toplevel(self.root)
+        cast_win.title("Castear pantalla del PC")
+        cast_win.transient(self.root)
+        cast_win.update_idletasks()
+        width = 460
+        height = 250
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        x = min(x, max(0, cast_win.winfo_screenwidth() - width))
+        y = min(y, max(0, cast_win.winfo_screenheight() - height))
+        cast_win.geometry(f"{width}x{height}+{x}+{y}")
+        cast_win.grab_set()
+
+        ttk.Label(
+            cast_win,
+            text="Esto comparte la pantalla completa del PC, no solo la ventana de scrcpy.\n"
+            "Deja scrcpy visible y selecciona el televisor en el panel que se abrirá.",
+            wraplength=420,
+            justify=tk.LEFT,
+            padding=12
+        ).pack(fill=tk.X)
+
+        options = ttk.LabelFrame(cast_win, text="Selecciona el tipo de receptor", padding=10)
+        options.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+        ttk.Button(
+            options,
+            text="Google Cast (Chromecast / Google TV)",
+            command=self.open_google_cast
+        ).pack(fill=tk.X, pady=4)
+        ttk.Button(
+            options,
+            text="Miracast (pantalla inalámbrica / algunos AnyCast)",
+            command=self.open_miracast
+        ).pack(fill=tk.X, pady=4)
+
+        ttk.Label(
+            options,
+            text="El PC y la TV deben estar preparados para el mismo protocolo.\n"
+            "La compatibilidad depende del sistema, el adaptador Wi-Fi y el modelo de TV.",
+            wraplength=410,
+            justify=tk.LEFT
+        ).pack(anchor="w", pady=(8, 0))
+
+    def open_google_cast(self):
+        browser = self._find_google_cast_browser()
+        if not browser:
+            messagebox.showerror(
+                "Navegador compatible no encontrado",
+                "Instala Google Chrome para escritorio y vuelve a intentarlo.\n\n"
+                "Descarga: https://www.google.com/chrome/"
+            )
+            return
+
+        try:
+            subprocess.Popen([browser, "--new-window"], **PROCESS_CREATION_OPTIONS)
+            messagebox.showinfo(
+                "Iniciar Google Cast",
+                "En la ventana del navegador:\n"
+                "1. Abre el menú ⋮.\n"
+                "2. Selecciona «Transmitir», «Cast» o «Guardar y compartir > Transmitir».\n"
+                "3. En «Fuentes», elige «Transmitir pantalla» y selecciona la TV.\n\n"
+                "Mantén scrcpy visible en el escritorio que vas a compartir."
+            )
+            self.log("Abierto el navegador para iniciar Google Cast de pantalla.")
+        except OSError as e:
+            messagebox.showerror("No se pudo abrir el navegador", str(e))
+            self.log(f"Error al abrir el navegador para Google Cast: {e}")
+
+    def _find_google_cast_browser(self):
+        browser_names = (
+            ("chrome", "google-chrome", "google-chrome-stable")
+            if not IS_WINDOWS else ("chrome",)
+        )
+        for name in browser_names:
+            browser = shutil.which(name)
+            if browser:
+                return browser
+
+        if IS_WINDOWS:
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            program_files = os.environ.get("PROGRAMFILES", "")
+            program_files_x86 = os.environ.get("PROGRAMFILES(X86)", "")
+            candidates = [
+                os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe")
+            ]
+            for candidate in candidates:
+                if candidate and os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    def open_miracast(self):
+        if IS_WINDOWS:
+            try:
+                user32 = ctypes.windll.user32
+                key_up = 0x0002
+                vk_lwin = 0x5B
+                vk_k = 0x4B
+                user32.keybd_event(vk_lwin, 0, 0, 0)
+                user32.keybd_event(vk_k, 0, 0, 0)
+                user32.keybd_event(vk_k, 0, key_up, 0)
+                user32.keybd_event(vk_lwin, 0, key_up, 0)
+                self.log("Abierto el selector de pantalla inalámbrica de Windows (Win+K).")
+            except Exception as e:
+                messagebox.showerror("No se pudo abrir Miracast", str(e))
+                self.log(f"Error al abrir el selector Miracast de Windows: {e}")
+            return
+
+        network_displays = shutil.which("gnome-network-displays")
+        if not network_displays:
+            messagebox.showwarning(
+                "GNOME Network Displays no está instalado",
+                "Para probar Miracast en Linux, instala GNOME Network Displays "
+                "desde los repositorios de tu distribución.\n\n"
+                "La disponibilidad depende del escritorio, los controladores y "
+                "el adaptador Wi-Fi. No todos los AnyCast son compatibles."
+            )
+            return
+
+        try:
+            subprocess.Popen([network_displays], **PROCESS_CREATION_OPTIONS)
+            self.log("Abierto GNOME Network Displays para buscar receptores Miracast.")
+        except OSError as e:
+            messagebox.showerror("No se pudo abrir GNOME Network Displays", str(e))
+            self.log(f"Error al abrir GNOME Network Displays: {e}")
 
     def take_screenshot(self):
         def task():
@@ -1259,7 +1406,7 @@ class ADBScrcpyApp:
                 self.logcat_process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore",
-                    creationflags=CREATE_NO_WINDOW
+                    **PROCESS_CREATION_OPTIONS
                 )
                 while self.is_monitoring_notifications and not self._is_closing and self.logcat_process and self.logcat_process.poll() is None:
                     line = self.logcat_process.stdout.readline()
@@ -1292,7 +1439,7 @@ class ADBScrcpyApp:
 
     def show_windows_toast(self, title, message):
         try:
-            if not self._is_closing:
+            if IS_WINDOWS and self.tray is not None and not self._is_closing:
                 self.tray.show_balloon(title, message)
         except Exception:
             pass
